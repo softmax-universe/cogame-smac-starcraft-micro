@@ -15,7 +15,7 @@ import pathlib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SLUG = "smac-starcraft-micro"
 IMAGE = "{{SMAC_STARCRAFT_MICRO_IMAGE}}"
-SOURCE = "https://github.com/Metta-AI/cogame-smac-starcraft-micro/tree/main"
+SOURCE = "https://github.com/softmax-universe/cogame-smac-starcraft-micro/tree/main"
 
 
 def text(path):
