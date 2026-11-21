@@ -160,5 +160,5 @@ suite "engine":
       if "falling back" notin code or code.startsWith("#"):
         continue
       inc printed
-      check "falling back to focusfire (" in code
+      check "falling back to neutral hold (" in code
     check printed == 2
