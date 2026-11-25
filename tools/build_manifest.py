@@ -249,7 +249,7 @@ CERT_CONFIG = {
     "turnSpacingMs": 0,
     "wallClockBudgetSeconds": 180,
     "lobbyJoinTimeoutTicks": 1440,
-    "startWaitTicks": 0,
+    "startWaitTicks": 24,
     "gameOverTicks": 24,
     "friendlySpawnX": 470,
     "enemySpawnX": 760,
@@ -299,23 +299,53 @@ manifest = {
             ],
         },
     },
-    "player": [{
-        "id": "baseline",
-        "type": "player",
-        "name": "Focus Fire Baseline",
-        "description":
-            "Scripted unit: the whole squad derives one kill order from state, "
-            "rangers kite when a melee enemy closes, blades screen the rangers.",
-        "image": IMAGE,
-        "run": ["/bin/smac-starcraft-micro-player"],
-        "env": {"PLAYER_SCRIPTED": "focusfire"},
-        "source_url": SOURCE,
-        # The bundled player CPU limit minimum is "1" (pistonball 0.1.1).
-        "resources": {
-            "requests": {"cpu": "100m", "memory": "64Mi"},
-            "limits": {"cpu": "1"},
+    "player": [
+        {
+            "id": "model",
+            "type": "player",
+            "name": "LLM Commander",
+            "description":
+                "LLM-driven unit commander: issues tactical JSON directives "
+                "every 5 seconds via the platform LLM sidecar.",
+            "image": IMAGE,
+            "run": ["/bin/smac-starcraft-micro-player"],
+            "env": {
+                "COWORLD_LLM_ENABLED": "true",
+                "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+                "PLAYER_POLICY_LABEL": "model",
+                "PLAYER_PROMPT": (
+                    "Coordinate focus fire on the lowest-HP enemy in range, "
+                    "kite melee threats as a ranger, and screen wounded rangers as a blade."
+                ),
+            },
+            "source_url": SOURCE,
+            # The bundled player CPU limit minimum is "1" (pistonball 0.1.1).
+            "resources": {
+                "requests": {"cpu": "100m", "memory": "64Mi"},
+                "limits": {"cpu": "1"},
+            },
         },
-    }],
+        {
+            "id": "baseline",
+            "type": "player",
+            "name": "Focus Fire Baseline",
+            "description":
+                "Scripted unit: the whole squad derives one kill order from state, "
+                "rangers kite when a melee enemy closes, blades screen the rangers.",
+            "image": IMAGE,
+            "run": ["/bin/smac-starcraft-micro-player"],
+            "env": {
+                "PLAYER_SCRIPTED": "focusfire",
+                "PLAYER_POLICY_LABEL": "focusfire",
+            },
+            "source_url": SOURCE,
+            # The bundled player CPU limit minimum is "1" (pistonball 0.1.1).
+            "resources": {
+                "requests": {"cpu": "100m", "memory": "64Mi"},
+                "limits": {"cpu": "1"},
+            },
+        },
+    ],
     "variants": [
         {
             "id": vid,
@@ -326,7 +356,7 @@ manifest = {
         for vid, name, description, roles, enemy_roles, map_path in VARIANTS
     ],
     "certification": {
-        "players": [{"player_id": "baseline"} for _ in range(5)],
+        "players": [{"player_id": "model"}] + [{"player_id": "baseline"} for _ in range(4)],
         "game_config": CERT_CONFIG,
     },
 }

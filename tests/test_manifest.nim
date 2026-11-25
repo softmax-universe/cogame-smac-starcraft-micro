@@ -97,8 +97,18 @@ suite "manifest":
     check not m["game"].hasKey("display_name")
     check m["game"].hasKey("owner")
     check m["game"]["runnable"]["type"].getStr() == "game"
-    check m["player"].len == 1
+    check m["player"].len == 2
+    check m["player"][0]["id"].getStr() == "model"
+    check m["player"][0]["env"]["COWORLD_LLM_ENABLED"].getStr() == "true"
+    check m["player"][0]["env"]["COWORLD_LLM_MODEL"].getStr().len > 0
     check m["player"][0]["resources"]["limits"]["cpu"].getStr() == "1"
+    check m["player"][1]["id"].getStr() == "baseline"
+    check m["player"][1]["env"]["PLAYER_SCRIPTED"].getStr() == "focusfire"
+    check not m["player"][1]["env"].hasKey("COWORLD_LLM_ENABLED")
+    check m["player"][1]["resources"]["limits"]["cpu"].getStr() == "1"
+    check m["certification"]["players"][0]["player_id"].getStr() == "model"
+    for i in 1 ..< 5:
+      check m["certification"]["players"][i]["player_id"].getStr() == "baseline"
 
   test "the image placeholder derives from the compose service name":
     let m = manifest()
@@ -107,7 +117,8 @@ suite "manifest":
     check "coworld-smac-starcraft-micro:latest" in compose
     check m["game"]["runnable"]["image"].getStr() ==
       "{{SMAC_STARCRAFT_MICRO_IMAGE}}"
-    check m["player"][0]["image"].getStr() == "{{SMAC_STARCRAFT_MICRO_IMAGE}}"
+    for player in m["player"]:
+      check player["image"].getStr() == "{{SMAC_STARCRAFT_MICRO_IMAGE}}"
 
   test "hosted inference needs no provider secret":
     let m = manifest()

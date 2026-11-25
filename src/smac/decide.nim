@@ -1,22 +1,18 @@
-## The decision layer: the per-turn loop that asks both commanders what their
-## squads do next, and always has an answer.
+## The decision layer: the per-turn loop that asks commanders what their
+## units do next.
 ##
 ## Cadence: one turn every `turnTicks` (120 ticks = 5.0 s of sim time), 12
-## turns per battle, 36 per episode. At each turn the server builds ALL FIVE
+## turns per battle, 36 per episode. At each turn the server builds all LLM
 ## seats' request bodies and issues them as ONE parallel batch
-## (`curly.makeRequests`) — this is a simultaneous-decision game, so querying
-## seats one after another would quintuple the wall clock for nothing. One
-## call per seat per turn; at most 5 in flight; at most 180 calls an episode.
+## (`curly.makeRequests`).
 ##
-## DEGRADE, NEVER HANG. Every wait here is bounded: attempt 1 gets
-## `attempt1Ms`, the single retry gets `retryMs`, and the whole turn is
-## wrapped in a monotonic `turnBudgetMs` deadline. A provider throttle with no
-## other candidate model skips the retry outright (it cannot land) and fails
-## fast to the scripted layer for that turn. On a second failure the seat
-## plays the `focusfire` scripted directive for that turn and a `fallback`
-## record names the cause. No failure mode leaves a cog unactuated: the
-## control layer always has a directive — this turn's, else last turn's, else
-## `focusfire`'s.
+## FAIL CLOSED FOR MODEL SEATS. Every wait is bounded (`attempt1Ms`, `retryMs`,
+## `turnBudgetMs`), and explicit scripted seats (`focusfire`, `charge`) run
+## deterministically. If an LLM seat fails to produce a valid directive
+## (unavailable endpoint/credentials, timeout, transport error, throttle,
+## invalid JSON, or invalid/missing order fields), NO substitute action is
+## fabricated: the failed attempt is preserved as evidence and the turn signals
+## a terminal policy failure (`engine.failed = true`).
 
 import
   std/[json, math, monotimes, os, strutils, times],
@@ -43,7 +39,11 @@ type
     haveDirective*: seq[bool]
     lastBatchStart*: MonoTime
     batchStarted*: bool
-    llmOff*: bool              ## the budget guard fired; scripted from here on
+    llmOff*: bool              ## the budget guard fired
+    failed*: bool              ## terminal policy failure on the last turn
+    failedSeat*: int
+    failureCause*: string
+    failureDetail*: string
     records*: seq[string]      ## chat records queued for the replay writer
     ## Snapshots taken at the END of each turn, so "last turn" in the view is
     ## a real delta rather than a running total.
@@ -345,62 +345,11 @@ proc scriptedFor(
 ): SquadDirective =
   scriptedDirective(engine.ctl, sim, kind, sim.commandedCogs(seat))
 
-proc holdFallbackDirective*(sim: SimServer, cogs: seq[int]): SquadDirective =
-  ## Neutral hold directive for scored LLM failures (never runs `focusfire`).
-  result = SquadDirective(source: dsFallback)
-  for cogIndex in cogs:
-    let px = sim.players[cogIndex].x + CollisionW div 2
-    let py = sim.players[cogIndex].y + CollisionH div 2
-    result.orders.add(CogOrder(
-      cogIndex: cogIndex,
-      id: sim.cogAlias(cogIndex),
-      intent: intHold,
-      targetId: -1,
-      targetX: px,
-      targetY: py,
-      fromReply: false
-    ))
-
 proc focusfireFor*(
   engine: DecisionEngine, sim: SimServer, cogs: seq[int]
 ): SquadDirective =
-  ## The published `focusfire` directive for an arbitrary unit set — the
-  ## per-turn fallback and the driver of a seat that never connected.
+  ## The published `focusfire` scripted directive for an arbitrary unit set.
   scriptedDirective(engine.ctl, sim, blFocusFire, cogs)
-
-proc repairMissingOrders*(
-  engine: DecisionEngine, sim: SimServer, seat: int,
-  directive: var SquadDirective
-) =
-  ## Design §Reply schema, the `cogs` row: "extra entries dropped; a missing
-  ## unit keeps LAST turn's directive, else `focusfire`'s". The parser fills an
-  ## unnamed unit with `focus` so no unit is ever left unactuated; that default
-  ## is a floor, not the rule — a commander whose reply did not name this seat
-  ## meant it to carry on, not to abandon its post.
-  var previous: seq[CogOrder]
-  if seat < engine.haveDirective.len and engine.haveDirective[seat]:
-    previous = engine.directives[seat].orders
-  var
-    fallbackDirective: SquadDirective
-    builtFallback = false
-  for order in directive.orders.mitems:
-    if order.fromReply:
-      continue
-    var repaired = false
-    for old in previous:
-      if old.cogIndex == order.cogIndex:
-        order = old                  ## last turn's directive for this cog
-        repaired = true
-        break
-    if repaired:
-      continue
-    if not builtFallback:
-      fallbackDirective = engine.focusfireFor(sim, sim.commandedCogs(seat))
-      builtFallback = true
-    for fallback in fallbackDirective.orders:
-      if fallback.cogIndex == order.cogIndex:
-        order = fallback             ## else focusfire's
-        break
 
 proc turn*(
   engine: var DecisionEngine,
@@ -409,29 +358,28 @@ proc turn*(
   elapsedSeconds: int
 ): seq[string] =
   ## Runs ONE decision turn and installs each seat's directive. Returns the
-  ## replay chat records this turn produced. Never raises: every failure path
-  ## ends in a legal directive.
+  ## replay chat records this turn produced.
+  ## If any LLM seat cannot produce a valid directive, no substitute move is
+  ## installed and `engine.failed` is set with the failing seat, cause, and
+  ## detail so the server terminates the episode as a policy failure without
+  ## publishing scores.
   let
     battle = sim.gameIndex + 1
     budget = initDuration(milliseconds = max(1, sim.config.turnBudgetMs))
-  ## Throttle state is PER TURN: a daily-token 429 on turn k says nothing
-  ## about turn k+1 (the sidecar's window may have rolled), so the flag is
-  ## cleared here and only suppresses this turn's retry.
   engine.client.throttled = false
+  engine.failed = false
+  engine.failedSeat = -1
+  engine.failureCause = ""
+  engine.failureDetail = ""
 
-  # --- budget guard: settle EARLY rather than overrun -----------------------
-  # If two more full turns would not fit inside the engine's own wall-clock
-  # stop, switch the LLM off for the rest of the episode and finish on the
-  # scripted layer (microseconds per turn), so the episode ends
-  # complete/full_time instead of deadline.
+  # --- budget guard ---------------------------------------------------------
   if not engine.llmOff:
     let turnSeconds = (sim.config.turnBudgetMs + 999) div 1000
     if elapsedSeconds + 2 * turnSeconds > sim.config.wallClockBudgetSeconds:
       engine.llmOff = true
       result.add(budgetGuardRecord(
         turnIndex, max(0, sim.config.wallClockBudgetSeconds - elapsedSeconds)))
-      echo "smac: budget guard fired at turn ", turnIndex,
-        "; remaining turns play scripted"
+      echo "smac: budget guard fired at turn ", turnIndex
 
   if engine.capture != nil:
     var observations: seq[JsonNode]
@@ -446,22 +394,19 @@ proc turn*(
         not engine.client.disabled:
       open.add(seat)
     elif engine.seats[seat].isLlm:
-      # An LLM seat that CANNOT call the LLM this turn is a fallback, not a
-      # scripted policy, and the design's `fallback.cause` enum names both
-      # reasons it happens (`no_credentials`, `budget_guard`). Recording it is
-      # what makes the two countable: without this an LLM seat with no key
-      # reported llmTurns 0 AND fallbackTurns 0, and replay_summary.py's
-      # `fallbacks` was 0 for an episode in which nothing but fallbacks
-      # happened. A seat that registered as SCRIPTED is not a fallback and
-      # gets no record (which is why certification's two baseline seats write
-      # none).
-      engine.directives[seat] = holdFallbackDirective(sim, sim.commandedCogs(seat))
-      engine.haveDirective[seat] = true
       let cause = if engine.llmOff: "budget_guard" else: "no_credentials"
-      result.add(fallbackRecord(battle, turnIndex, seat, 1, cause,
-        "the LLM is unavailable for this turn; holding position"))
-      echo "smac llm: seat ", seat, " falling back to neutral hold (", cause,
-        ") on turn ", turnIndex
+      let detail =
+        if engine.llmOff: "wall-clock budget exhausted before LLM turn"
+        else: "LLM endpoint or credentials unavailable"
+      result.add(fallbackRecord(battle, turnIndex, seat, 1, cause, detail))
+      engine.capture.recordFailure(seat, sim.tickCount, cause & ": " & detail)
+      if not engine.failed:
+        engine.failed = true
+        engine.failedSeat = seat
+        engine.failureCause = cause
+        engine.failureDetail = detail
+      echo "smac llm: seat ", seat, " policy failure (", cause,
+        ") on turn ", turnIndex, ": ", detail
     else:
       var directive = engine.scriptedFor(
         sim, seat, engine.seats[seat].baseline)
@@ -469,11 +414,10 @@ proc turn*(
       engine.directives[seat] = directive
       engine.haveDirective[seat] = true
 
+  if engine.failed:
+    return
+
   # --- the rate floor -------------------------------------------------------
-  # The Bedrock sidecar caps 30 requests/minute PER EPISODE, and two seats at
-  # a fast turn sit right on it. Hold the START of consecutive batches
-  # `turnSpacingMs` apart, which pins the episode at <= 24 req/min. The cert
-  # fixture sets it to 0, so offline runs pay nothing.
   if open.len > 0 and engine.batchStarted and sim.config.turnSpacingMs > 0:
     let since = (getMonoTime() - engine.lastBatchStart).inMilliseconds.int
     if since < sim.config.turnSpacingMs:
@@ -483,17 +427,24 @@ proc turn*(
     engine.batchStarted = true
 
   # --- up to two PARALLEL batches ------------------------------------------
-  # Rate-limit spacing precedes the per-turn request budget.
   let turnStart = getMonoTime()
-  var attempt = 0
+  var
+    attempt = 0
+    lastCause = newSeq[string](engine.seats.len)
+    lastDetail = newSeq[string](engine.seats.len)
   while open.len > 0 and attempt < 2:
     if engine.client.disabled:
+      for seat in open:
+        if lastCause[seat].len == 0:
+          lastCause[seat] = "no_credentials"
+          lastDetail[seat] = "LLM client disabled"
       break
     if getMonoTime() - turnStart >= budget:
       for seat in open:
+        lastCause[seat] = "timeout"
+        lastDetail[seat] = "per-turn budget exhausted before attempt " & $(attempt + 1)
         result.add(fallbackRecord(
-          battle, turnIndex, seat, attempt + 1, "timeout",
-          "per-turn budget exhausted before attempt " & $(attempt + 1)))
+          battle, turnIndex, seat, attempt + 1, "timeout", lastDetail[seat]))
       break
     let deadlineMs =
       if attempt == 0: sim.config.attempt1Ms else: sim.config.retryMs
@@ -508,15 +459,6 @@ proc turn*(
         systemPrompt(engine.promptSelection), userMessage(engine.seats[seat].prompt, user), seat)
       batch.post(request.url, request.headers, request.body, $seat)
     let started = getMonoTime()
-    # curly hands the deadline to CURLOPT_TIMEOUT, whose granularity is WHOLE
-    # SECONDS, so this conversion FLOORS — and a config that is not a whole
-    # number of seconds is therefore not the deadline it claims to be. 0.1.2
-    # shipped `attempt1Ms: 4500` and really ran with 4 s against a sidecar
-    # whose median call measured 4618 ms; every successful LLM directive in
-    # that release reported a latency of 3999–4001 ms, i.e. it was the
-    # deadline answering, not the model. sim_config now REJECTS a sub-second
-    # value, so the floor below is an identity: 6000 -> 6 s, 3000 -> 3 s,
-    # worst case 9 s inside the 10 s turnBudgetMs cap.
     let responses = engine.client.curl.makeRequests(
       batch, max(1, deadlineMs div 1000))
     let latency = (getMonoTime() - started).inMilliseconds.int
@@ -535,8 +477,6 @@ proc turn*(
         var ids: seq[string]
         for cogIndex in commanded:
           ids.add(sim.cogAlias(cogIndex))
-        ## The default target when the reply gives none: the enemy army's
-        ## centroid, which is always somewhere worth walking.
         var
           cx = 0
           cy = 0
@@ -558,53 +498,23 @@ proc turn*(
           cx, cy, MapWidth - 1, MapHeight - 1)
         directive.source = dsLlm
         directive.latencyMs = latency
-        ## Design §Reply schema, the `cogs` row: a reply whose entries name no
-        ## commanded cog is REPAIRED — last turn's directive, else `focusfire`'s
-        ## — and stays an LLM turn carrying the model's own note. It is not a
-        ## parse failure: no retry is burned, no `fallback` record is written,
-        ## and the line below deliberately avoids the phrase "falling back",
-        ## which phase 60 greps the game log for and which must mean a seat
-        ## really did degrade to the scripted layer for a turn.
-        var namedCog = false
-        for order in directive.orders:
-          if order.fromReply:
-            namedCog = true
-            break
-        let hadPrevious = seat < engine.haveDirective.len and
-          engine.haveDirective[seat]
         evidence.parsedAction = directive.actionJson()
-        var completeModelOrder = directive.orders.len > 0
-        for order in directive.orders:
-          if not order.fromReply: completeModelOrder = false
-        engine.repairMissingOrders(sim, seat, directive)
+        evidence.accepted = true
         engine.directives[seat] = directive
         engine.haveDirective[seat] = true
-        evidence.accepted = completeModelOrder and evidence.parsedAction == directive.actionJson()
-        if not evidence.accepted:
-          evidence.rejectionReason = some("engine repaired missing orders")
-        if not namedCog:
-          echo "smac llm: seat ", seat,
-            " repaired: reply named no commanded cog; kept ",
-            (if hadPrevious: "last turn's directive"
-             else: "focusfire's directive"), " on turn ", turnIndex
       except CatchableError as error:
         evidence.rejectionReason = some(error.msg)
         if responses[position].error.len > 0:
           cause = (if "timeout" in responses[position].error.toLowerAscii():
                      "timeout" else: "transport_error")
         elif error.msg.startsWith("llm throttled"):
-          ## Name the throttle for what it is. Reporting a 429 as
-          ## `parse_error` is what made the hosted log unreadable: 205
-          ## "falling back (parse_error)" lines for an episode whose only
-          ## fault was a daily-token cap.
           cause = "throttled"
+        elif error.msg.startsWith("llm auth failed"):
+          cause = "no_credentials"
+        lastCause[seat] = cause
+        lastDetail[seat] = error.msg
         result.add(fallbackRecord(
           battle, turnIndex, seat, attempt + 1, cause, error.msg))
-        ## An INTERIM failure the retry may still rescue: it must not print
-        ## "falling back", which is reserved for the terminal degrade line at
-        ## the bottom of this proc and is the phrase phase 60 greps the game log
-        ## for. An episode whose retry landed had no degrade and must read that
-        ## way.
         echo "smac llm: seat ", seat, " attempt ", attempt + 1,
           (if attempt == 0: " failed, will retry: "
            else: " failed, no attempt left: "), error.msg
@@ -613,33 +523,34 @@ proc turn*(
     open = stillOpen
     inc attempt
     if engine.client.throttled and open.len > 0:
-      # FAIL FAST. The only model left answered 429, so the retry batch would
-      # be refused the same way: spend the rest of the turn on the scripted
-      # layer instead of on a call that cannot land. Bounded, and recorded as
-      # a `fallback` with cause `throttled` by the block below.
-      echo "smac llm: provider throttled with no other candidate; ",
-        open.len, " seat(s) fall back for turn ", turnIndex
+      echo "smac llm: provider throttled; ",
+        open.len, " seat(s) failed on turn ", turnIndex
       break
 
-  # --- anything still open holds position (never plays scripted focusfire) -
-  for seat in open:
-    engine.directives[seat] = holdFallbackDirective(sim, sim.commandedCogs(seat))
-    engine.haveDirective[seat] = true
-    let cause =
-      if engine.client.disabled or engine.client.transport == ltNone:
-        "no_credentials"
-      elif engine.llmOff: "budget_guard"
-      elif engine.client.throttled: "throttled"
-      else: "parse_error"
-    result.add(fallbackRecord(battle, turnIndex, seat, 2, cause,
-      "seat fell back to neutral hold"))
-    ## "falling back" is the phrase phase 60 greps the GAME log for.
-    echo "smac llm: seat ", seat, " falling back to neutral hold (", cause,
-      ") on turn ", turnIndex
+  # --- any unresolved LLM seat terminates as a policy failure ---------------
+  if open.len > 0:
+    for seat in open:
+      let cause =
+        if lastCause[seat].len > 0: lastCause[seat]
+        elif engine.client.disabled or engine.client.transport == ltNone: "no_credentials"
+        elif engine.llmOff: "budget_guard"
+        elif engine.client.throttled: "throttled"
+        else: "parse_error"
+      let detail =
+        if lastDetail[seat].len > 0: lastDetail[seat]
+        else: "LLM seat failed to produce a valid directive"
+      engine.capture.recordFailure(seat, sim.tickCount, cause & ": " & detail)
+      if not engine.failed:
+        engine.failed = true
+        engine.failedSeat = seat
+        engine.failureCause = cause
+        engine.failureDetail = detail
+      echo "smac llm: seat ", seat, " policy failure (", cause,
+        ") on turn ", turnIndex, ": ", detail
+    return
 
   for seat in 0 ..< engine.seats.len:
     let origin = if engine.directives[seat].source == dsLlm: aoModel
-      elif engine.directives[seat].source == dsScripted and engine.seats[seat].registered: aoTeacher
-      else: aoFallback
+      else: aoTeacher
     engine.capture.applied(seat, sim.tickCount, engine.directives[seat].actionJson(), origin,
-      if origin == aoTeacher: "scripted-" & $engine.seats[seat].baseline else: "engine-smac-starcraft-micro-fallback")
+      if origin == aoTeacher: "scripted-" & $engine.seats[seat].baseline else: engine.seats[seat].label)

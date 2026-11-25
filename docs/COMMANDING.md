@@ -72,18 +72,15 @@ of whether the trade is going your way.
 * Keep it under ~250 words. The board is already in the message; the prompt's
   job is the policy, not the situation.
 
-## What will get you fallbacks
+## What causes a policy failure
 
 The reply must be a single JSON object beginning with `{`, with exactly one
-`cogs` entry — your own unit. Prose before the object is tolerated, fences are
-tolerated, `"E3"` where an integer was asked for is tolerated, and an unknown
-intent is repaired to `focus`. What is NOT recoverable is a reply with no JSON
-object in it at all: that costs a retry, and a second failure costs the turn.
-The seat plays the published `focusfire` baseline for that turn, which is not a
-disaster — but it is not your policy playing.
-
-Check `results.fallbackTurns` after an episode. A champion with more fallbacks
-than LLM turns is a prompt bug, not a platform outage.
+`cogs` entry matching your own unit's exact `id`, a valid canonical `intent`
+(`focus`, `attack_move`, `kite`, `hold`, `screen`, `retreat`, `regroup`), and
+an integer or `null` `target_id`. Invalid JSON, wrong types, unknown intents,
+or missing/extra `cogs` entries are retried once; a second failure ends the
+episode as an explicit policy failure (`COGAME_PLAYER_FAILURE_URI`) with no
+substitute move and no new scores.
 
 ## Testing a prompt
 

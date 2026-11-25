@@ -94,60 +94,38 @@ proc sanitizeNote*(text: string): string =
   text.replace("\n", " ").replace("\r", " ").strip().truncateRunes(MaxNoteRunes)
 
 proc parseIntent*(text: string): Intent =
-  ## Tolerant: case-insensitive, hyphens and spaces normalised to
-  ## underscores. Anything still unknown becomes `focus` — the intent that
-  ## always has something useful to do.
-  let key = text.strip().toLowerAscii().replace("-", "_").replace(" ", "_")
+  ## Strict canonical intent parser. Unknown or empty intents raise
+  ## DirectiveError rather than fabricating a move.
+  let key = text.strip()
   for intent in Intent:
     if $intent == key:
       return intent
-  intFocus
+  raise newException(DirectiveError, "invalid intent: " & key.truncateRunes(32))
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## The outermost balanced `{...}` in a model reply, tolerating markdown
-  ## fences and any prose the model prefixed or suffixed. Falls back to
-  ## first-brace..last-brace when the scan finds no balanced pair, which is
-  ## what recovers a reply whose braces sit inside a quoted string.
-  var
-    depth = 0
-    start = -1
-    inString = false
-    escaped = false
-  for i, ch in text:
-    if inString:
-      if escaped: escaped = false
-      elif ch == '\\': escaped = true
-      elif ch == '"': inString = false
-      continue
-    case ch
-    of '"': inString = true
-    of '{':
-      if depth == 0: start = i
-      inc depth
-    of '}':
-      if depth > 0:
-        dec depth
-        if depth == 0 and start >= 0:
-          try:
-            return parseJson(text[start .. i])
-          except CatchableError:
-            start = -1
-    else: discard
-  let
-    first = text.find('{')
-    last = text.rfind('}')
-  if first < 0 or last <= first:
-    var head = text.strip()
+  ## Parses a single JSON object from a model reply, unwrapping a single outer
+  ## markdown code fence if present. Rejects prose, non-JSON text, or
+  ## non-object values with DirectiveError.
+  var trimmed = text.strip()
+  if trimmed.startsWith("```") and trimmed.endsWith("```") and trimmed.len >= 6:
+    let nl = trimmed.find('\n')
+    if nl > 0 and nl < trimmed.len - 3:
+      trimmed = trimmed[nl + 1 ..< trimmed.len - 3].strip()
+  if trimmed.len == 0 or trimmed[0] != '{':
+    var head = trimmed
     if head.runeLen > 160:
       head = head.truncateRunes(160) & "..."
     raise newException(
-      DirectiveError, "no JSON object in reply: " & head.replace("\n", " "))
-  parseJson(text[first .. last])
+      DirectiveError, "reply must be a JSON object starting with '{': " &
+        head.replace("\n", " "))
+  try:
+    result = parseJson(trimmed)
+  except CatchableError as e:
+    raise newException(DirectiveError, "invalid JSON in reply: " & e.msg)
+  if result.kind != JObject:
+    raise newException(DirectiveError, "reply JSON must be an object")
 
 proc readCoord(node: JsonNode): tuple[ok: bool, value: int] =
-  ## One target/face coordinate: an int, a float, or a numeric string.
-  ## Anything non-finite or unparseable reports `ok = false` so the caller
-  ## can apply its own default rather than inventing a position.
   if node.isNil:
     return (false, 0)
   case node.kind
@@ -157,32 +135,24 @@ proc readCoord(node: JsonNode): tuple[ok: bool, value: int] =
     let f = node.getFloat()
     if f != f or f > 1.0e9 or f < -1.0e9: (false, 0)
     else: (true, int(f))
-  of JString:
-    try: (true, int(parseFloat(node.getStr().strip())))
-    except CatchableError: (false, 0)
   else:
     (false, 0)
 
 proc readPoint(
-  node: JsonNode, defaultX, defaultY, maxX, maxY: int
+  node: JsonNode, fieldName: string, defaultX, defaultY, maxX, maxY: int
 ): tuple[given: bool, x, y: int] =
-  ## A `[x, y]` pair (an object with x/y keys is accepted too), clamped into
-  ## the map box. A missing or non-finite pair reports `given = false` and
-  ## returns the caller's default.
-  result = (false, defaultX, defaultY)
+  ## A `[x, y]` coordinate pair, clamped into the map box. Absent or null
+  ## returns `given = false` with the caller's default; malformed values raise
+  ## DirectiveError.
   if node.isNil or node.kind == JNull:
-    return
-  var
-    rx = (ok: false, value: 0)
-    ry = (ok: false, value: 0)
-  if node.kind == JArray and node.len >= 2:
+    return (false, defaultX, defaultY)
+  if node.kind != JArray or node.len != 2:
+    raise newException(DirectiveError, fieldName & " must be [x, y] or null")
+  let
     rx = readCoord(node[0])
     ry = readCoord(node[1])
-  elif node.kind == JObject:
-    rx = readCoord(node{"x"})
-    ry = readCoord(node{"y"})
   if not rx.ok or not ry.ok:
-    return
+    raise newException(DirectiveError, fieldName & " coordinates must be finite numbers")
   result = (
     true,
     clamp(rx.value, 0, max(0, maxX)),
@@ -190,47 +160,13 @@ proc readPoint(
   )
 
 proc readTargetId*(node: JsonNode): int =
-  ## The order's `target_id`, read TOLERANTLY: an integer, a float, a numeric
-  ## string, or the enemy's in-game name in either case ("E3", "e3"). Anything
-  ## else — including an explicit null — reads as -1, and the control layer
-  ## then picks the living enemy nearest the order's `target`.
+  ## The order's `target_id`: an integer enemy id or null (-1). Any other type
+  ## raises DirectiveError.
   if node.isNil or node.kind == JNull:
     return -1
-  case node.kind
-  of JInt:
-    int(node.getBiggestInt())
-  of JFloat:
-    let f = node.getFloat()
-    if f != f or f > 1.0e9 or f < -1.0e9: -1 else: int(f)
-  of JString:
-    var text = node.getStr().strip()
-    if text.len > 1 and (text[0] == 'E' or text[0] == 'e'):
-      text = text[1 .. ^1]
-    try: int(parseFloat(text.strip()))
-    except CatchableError: -1
-  else:
-    -1
-
-proc cogEntries(payload: JsonNode): seq[tuple[id: string, node: JsonNode]] =
-  ## The reply's `cogs` collection, accepted either as an ARRAY of objects or
-  ## as an OBJECT keyed by cog id (both shapes are things models actually
-  ## emit). Entries that are not objects are dropped.
-  let node = payload{"cogs"}
-  if node.isNil:
-    return @[]
-  ## Every id is capped at MaxCogIdRunes on a RUNE boundary first: it is
-  ## model-authored and otherwise unbounded, and the matcher below runs
-  ## `endsWith` over it in both directions. The cap clears the longest alias
-  ## this game issues, so no real id is cut into a mismatch.
-  if node.kind == JArray:
-    for item in node:
-      if item.kind == JObject:
-        result.add((item{"id"}.getStr().truncateRunes(MaxCogIdRunes), item))
-  elif node.kind == JObject:
-    for key, item in node:
-      if item.kind == JObject:
-        let raw = if item{"id"}.getStr().len > 0: item{"id"}.getStr() else: key
-        result.add((raw.truncateRunes(MaxCogIdRunes), item))
+  if node.kind == JInt:
+    return int(node.getBiggestInt())
+  raise newException(DirectiveError, "target_id must be an integer or null")
 
 proc parseSquadDirective*(
   payload: JsonNode,
@@ -238,81 +174,69 @@ proc parseSquadDirective*(
   commandedCogs: seq[int],
   defaultX, defaultY, maxX, maxY: int
 ): SquadDirective =
-  ## Turns one parsed reply into a legal directive, REPAIRING every field the
-  ## schema bounds rather than rejecting the reply:
-  ##
-  ## * `note`      truncated to MaxNoteRunes on a rune boundary;
-  ## * `cogs`      extra entries dropped; a cog no entry named is left with
-  ##               `fromReply = false` for the caller to fill from last turn
-  ##               (else from `focusfire`);
-  ## * `cogs[].id` matched case-insensitively and suffix-wise; an unmatched
-  ##               entry is assigned to the next unclaimed commanded cog BY
-  ##               POSITION, which is what rescues a model that invented its
-  ##               own naming;
-  ## * `intent`    unknown -> focus;
-  ## * `target_id` an int, a numeric string or "E3"/"e3"; anything else -> -1,
-  ##               which the control layer resolves to the living enemy
-  ##               nearest the order's `target`;
-  ## * `target`    missing / non-finite -> the caller's default (the hill
-  ##               centre); otherwise clamped to the map box;
-  ## * `face`      same clamp, absent -> none;
-  ## * `say`       truncated to MaxSayRunes on a rune boundary, then the
-  ##               starter's printable-ASCII shout filter.
-  ##
-  ## Never raises for a reply that PARSED: a `cogs` collection with no entry
-  ## this seat can use (empty, missing, or nothing but non-objects) leaves every
-  ## order with `fromReply = false`, and the caller's `repairMissingOrders`
-  ## resolves it to last turn's directive, else `focusfire`'s — the schema's own
-  ## repair, not a parse failure, so it burns no retry and records no fallback.
-  ## Only text from which no JSON object can be recovered at all raises
-  ## (`extractJsonObject`), and that is the one condition the retry and then the
-  ## scripted fallback exist for.
+  ## Strictly parses one model reply into a legal SquadDirective.
+  ## Rejects missing/extra cogs, mismatched ids, invalid intents, or malformed
+  ## coordinate/target_id fields with DirectiveError rather than silently
+  ## repairing or fabricating orders. Rune-boundary truncation is applied to
+  ## `note` and `say` so replay records remain valid UTF-8.
   doAssert commandedIds.len == commandedCogs.len
-  result.note = sanitizeNote(payload{"note"}.getStr())
+  if payload.isNil or payload.kind != JObject:
+    raise newException(DirectiveError, "directive payload must be a JSON object")
+  if payload.hasKey("note") and payload["note"].kind != JNull:
+    if payload["note"].kind != JString:
+      raise newException(DirectiveError, "note must be a string or null")
+    result.note = sanitizeNote(payload["note"].getStr())
   result.source = dsLlm
+  if not payload.hasKey("cogs") or payload["cogs"].kind != JArray:
+    raise newException(DirectiveError, "cogs must be a JSON array")
+  let cogsNode = payload["cogs"]
+  if cogsNode.len != commandedIds.len:
+    raise newException(
+      DirectiveError,
+      "cogs must contain exactly " & $commandedIds.len & " entry(s), got " &
+        $cogsNode.len)
   var
     claimed = newSeq[bool](commandedIds.len)
-    byPosition = 0
     orders = newSeq[CogOrder](commandedIds.len)
-  for i in 0 ..< commandedIds.len:
-    orders[i] = CogOrder(
-      cogIndex: commandedCogs[i],
-      id: commandedIds[i],
-      intent: intFocus,
-      targetId: -1,
-      targetX: defaultX,
-      targetY: defaultY
-    )
-  for entry in cogEntries(payload):
+  for item in cogsNode:
+    if item.kind != JObject:
+      raise newException(DirectiveError, "each cogs entry must be a JSON object")
+    if not item.hasKey("id") or item["id"].kind != JString:
+      raise newException(DirectiveError, "cogs[].id must be a string")
+    let rawId = item["id"].getStr().strip().truncateRunes(MaxCogIdRunes)
     var slot = -1
-    let wanted = entry.id.strip().toLowerAscii()
-    if wanted.len > 0:
-      for i, id in commandedIds:
-        if claimed[i]:
-          continue
-        let mine = id.toLowerAscii()
-        if mine == wanted or mine.endsWith(wanted) or wanted.endsWith(mine):
-          slot = i
-          break
+    for i, id in commandedIds:
+      if not claimed[i] and id == rawId:
+        slot = i
+        break
     if slot < 0:
-      while byPosition < claimed.len and claimed[byPosition]:
-        inc byPosition
-      if byPosition >= claimed.len:
-        continue                     ## extra entries are dropped, never fatal
-      slot = byPosition
+      raise newException(
+        DirectiveError, "cogs[].id does not match commanded unit: " & rawId)
+    if not item.hasKey("intent") or item["intent"].kind != JString:
+      raise newException(DirectiveError, "cogs[].intent must be a string")
+    let intent = parseIntent(item["intent"].getStr())
+    let targetId = readTargetId(item{"target_id"})
+    let target = readPoint(item{"target"}, "target", defaultX, defaultY, maxX, maxY)
+    let face = readPoint(item{"face"}, "face", 0, 0, maxX, maxY)
+    var say = ""
+    if item.hasKey("say") and item["say"].kind != JNull:
+      if item["say"].kind != JString:
+        raise newException(DirectiveError, "cogs[].say must be a string or null")
+      say = sanitizeSay(item["say"].getStr())
     claimed[slot] = true
-    orders[slot].fromReply = true
-    let node = entry.node
-    orders[slot].intent = parseIntent(node{"intent"}.getStr())
-    orders[slot].targetId = readTargetId(node{"target_id"})
-    let target = readPoint(node{"target"}, defaultX, defaultY, maxX, maxY)
-    orders[slot].targetX = target.x
-    orders[slot].targetY = target.y
-    let face = readPoint(node{"face"}, 0, 0, maxX, maxY)
-    orders[slot].hasFace = face.given
-    orders[slot].faceX = face.x
-    orders[slot].faceY = face.y
-    orders[slot].say = sanitizeSay(node{"say"}.getStr())
+    orders[slot] = CogOrder(
+      cogIndex: commandedCogs[slot],
+      id: commandedIds[slot],
+      intent: intent,
+      targetId: targetId,
+      targetX: target.x,
+      targetY: target.y,
+      hasFace: face.given,
+      faceX: face.x,
+      faceY: face.y,
+      say: say,
+      fromReply: true
+    )
   result.orders = orders
 
 proc directiveRecord*(

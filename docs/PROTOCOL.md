@@ -13,6 +13,7 @@ sends:
 
   ```json
   {"type": "register",
+   "llm": true | false,
    "prompt": "<strategy text, or empty>",
    "scripted": "focusfire" | "charge" | null,
    "policy": "<free label>"}
@@ -21,8 +22,9 @@ sends:
   Joins are strictly slot-sequential, so a seat whose slot is not the next open
   one is not admitted until the lower slots have joined. The server HOLDS an
   unappliable registration and re-reads it when the slot lands, and this end
-  keeps re-sending it — registering twice is harmless. A seat that never
-  registers, or registers with neither field, is `focusfire`.
+  keeps re-sending it — registering twice is harmless. Model seats declare
+  `COWORLD_LLM_ENABLED=true` (and/or `PLAYER_PROMPT`) with `scripted: null`;
+  scripted seats declare `PLAYER_SCRIPTED=focusfire` or `charge`.
 
   The prompt is a secret: the server consumes the registration and writes a
   REDACTED `register` record to the replay carrying the policy label and kind
@@ -102,49 +104,45 @@ enemy AI's internal retarget, leash and stuck counters; and future ticks.
            "target": [640, 302], "face": [700, 300], "say": "E3"}]}
 ```
 
-| field | cap / legal values | repair when violated |
+| field | cap / legal values | handling when violated |
 |---|---|---|
 | `note` | <= 160 runes | truncated on a rune boundary; newlines collapse to spaces |
-| `cogs` | exactly 1 entry — your own unit | extras dropped; empty/missing keeps last turn's directive, else `focusfire`'s |
-| `cogs[].id` | your own alias, case-insensitive, suffix-tolerant, <= 16 runes | an unmatched entry is assigned by position |
-| `cogs[].intent` | `focus` `attack_move` `kite` `hold` `screen` `retreat` `regroup` | -> `focus` |
-| `cogs[].target_id` | the numeric id of a LIVING enemy | dead/unknown/null -> the living enemy nearest `target` |
-| `cogs[].target` | `[x, y]`, clamped to the map box and snapped to walkable ground | missing/non-finite -> the enemy named by `target_id`, else the army's centroid |
-| `cogs[].face` | `[x, y]` or null | -> null (the control layer picks the aim) |
-| `cogs[].say` | <= 10 runes | truncated, then printable ASCII minus braces; becomes a real in-game SHOUT audible within 247 px |
+| `cogs` | JSON array with exactly 1 entry — your own unit | rejected (`DirectiveError`) |
+| `cogs[].id` | your exact unit alias (e.g. `RANGER-alpha`) | rejected (`DirectiveError`) |
+| `cogs[].intent` | `focus` `attack_move` `kite` `hold` `screen` `retreat` `regroup` | rejected (`DirectiveError`) |
+| `cogs[].target_id` | integer enemy id or `null` | non-integer/non-null rejected (`DirectiveError`) |
+| `cogs[].target` | `[x, y]` or `null` (clamped to the map box) | malformed value rejected (`DirectiveError`) |
+| `cogs[].face` | `[x, y]` or `null` | malformed value rejected (`DirectiveError`) |
+| `cogs[].say` | <= 10 runes | truncated on a rune boundary, then printable ASCII minus braces; becomes a real in-game SHOUT audible within 247 px |
 
-Parsing is TOLERANT: markdown fences are stripped; the outermost balanced
-`{...}` is taken if the model prefixed prose; `cogs` may be an object keyed by
-id; a bare order object without the `cogs` wrapper is accepted; numeric strings
-are accepted for `target_id`/`target`/`face`; `"E3"` and `"e3"` are accepted
-where an integer id was asked for; unknown-case and hyphenated intents are
-normalised. Only when NO object with at least one usable entry can be recovered
-do the retry and then the scripted fallback fire.
+Parsing is STRICT: replies must be a single JSON object starting with `{`
+matching the schema above. Invalid JSON, wrong types, unknown intents, wrong
+unit ids, or missing/extra `cogs` entries are rejected rather than silently
+repaired or replaced with a scripted move.
 
 **Truncation is on RUNE (Unicode codepoint) boundaries, never bytes.** Slicing a
 string by byte index anywhere on the path to the replay is forbidden: a
 byte-truncated multi-byte character renders fine in a browser and then fails a
 strict UTF-8 parser.
 
-### Timing, and the degrade-never-hang contract
+### Timing, and fail-closed policy errors
 
-Attempt 1 gets a **6000 ms** batch deadline. Any seat that timed out, errored,
-returned non-JSON or returned no usable entry is retried **once** in a single
-batch with a **3000 ms** deadline — worst case 9.0 s inside the **10000 ms**
-per-turn cap. A provider throttle with no other candidate model SKIPS the retry
-outright and fails fast to the scripted layer for that turn. On a second failure
-the seat plays the `focusfire` directive and a `fallback` record names the cause
-(`timeout`, `parse_error`, `transport_error`, `throttled`, `no_credentials`,
-`budget_guard`).
+Attempt 1 gets a **6000 ms** batch deadline. Any LLM seat that timed out,
+errored, returned invalid JSON, or returned an invalid directive is retried
+**once** in a single batch with a **3000 ms** deadline — worst case 9.0 s inside
+the **10000 ms** per-turn cap. A provider throttle (HTTP 429) skips the retry
+outright.
+
+If an LLM seat still has no valid directive (due to `timeout`, `parse_error`,
+`transport_error`, `throttled`, `no_credentials`, or `budget_guard`), the
+engine does **not** fabricate a substitute move (`hold`, `focusfire`, or last
+turn's directive). It preserves the failed attempt evidence, writes a terminal
+policy failure to `COGAME_PLAYER_FAILURE_URI`, and terminates the episode
+without publishing `results.json` scores.
 
 A **12000 ms** wall-clock floor separates the STARTS of consecutive batches,
 which holds the episode at 25 requests/minute. It is a floor, not a sleep on the
 critical path — the loop keeps stepping sim ticks while it waits.
-
-At the start of each turn, if two more full turns would not fit inside the 690 s
-engine budget, the LLM is switched off for the rest of the episode and the
-episode finishes on the scripted layer, so it ends `complete` rather than
-`deadline`. A `budget_guard` record names the turn it fired.
 
 ## 3. The spectator streams
 

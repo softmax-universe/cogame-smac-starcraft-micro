@@ -66,7 +66,11 @@ network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
 
+stub_pid=""
 cleanup() {
+  if [ -n "${stub_pid}" ]; then
+    kill "${stub_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,11 +195,89 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+stub_log="${work_dir}/llm_stub_calls.jsonl"
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: forwarding to game container"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-  echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
+  echo "ANTHROPIC_API_KEY present: forwarding to game container"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  # Start a deterministic local HTTP LLM fixture server so CI exercises the
+  # real model wire path for the certification fixture's model seat(s).
+  stub_port_file="${work_dir}/stub_port"
+  python3 - "${stub_port_file}" "${stub_log}" <<'PY' &
+import http.server
+import json
+import sys
+
+port_file, log_path = sys.argv[1], sys.argv[2]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        req = json.loads(raw.decode("utf-8"))
+        slot = self.headers.get("X-Coworld-Player-Slot", "")
+        user_text = req["messages"][0]["content"]
+        idx = user_text.find("{")
+        view = json.loads(user_text[idx:]) if idx >= 0 else {}
+        you = view.get("you") or {}
+        enemies = view.get("enemies") or []
+        target_id = enemies[0]["id"] if enemies else None
+        target_pos = enemies[0]["pos"] if enemies else [640, 330]
+        reply = {
+            "note": f"smoke focus E{target_id}" if target_id else "smoke regroup",
+            "cogs": [{
+                "id": you.get("id", "RANGER-alpha"),
+                "intent": "focus" if target_id else "regroup",
+                "target_id": target_id,
+                "target": target_pos,
+                "face": None,
+                "say": f"E{target_id}" if target_id else "clear",
+            }],
+        }
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"slot": slot, "model": req.get("model"), "reply": reply}) + "\n")
+        body = json.dumps({
+            "id": "msg_smoke",
+            "type": "message",
+            "role": "assistant",
+            "model": req.get("model", "anthropic/claude-haiku-4.5"),
+            "content": [{"type": "text", "text": json.dumps(reply)}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 40},
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+srv = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+with open(port_file, "w", encoding="utf-8") as fh:
+    fh.write(str(srv.server_address[1]))
+srv.serve_forever()
+PY
+  stub_pid=$!
+  for _ in $(seq 1 40); do
+    if [ -s "${stub_port_file}" ]; then break; fi
+    sleep 0.1
+  done
+  test -s "${stub_port_file}" || { echo "FAIL: local LLM stub failed to start" >&2; exit 1; }
+  stub_port="$(cat "${stub_port_file}")"
+  game_env+=(
+    --add-host=host.docker.internal:host-gateway
+    -e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${stub_port}"
+    -e "COWORLD_LLM_MODEL=anthropic/claude-haiku-4.5"
+  )
+  echo "started local CI LLM stub on port ${stub_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
@@ -306,6 +388,24 @@ for key in ("names", "scores"):
 reason = results.get("reason") or results.get("end_reason")
 if reason is not None:
     print(f"episode end reason: {reason}")
+
+llm_turns = results.get("llmTurns") or []
+fallback_turns = results.get("fallbackTurns") or []
+if len(llm_turns) == seats:
+    if llm_turns[0] <= 0:
+        raise SystemExit(f"expected seat 0 model llmTurns > 0, got {llm_turns}")
+    if any(t != 0 for t in llm_turns[1:]):
+        raise SystemExit(f"expected scripted seats 1..4 llmTurns == 0, got {llm_turns}")
+if any(t != 0 for t in fallback_turns):
+    raise SystemExit(f"expected zero fallbackTurns, got {fallback_turns}")
+
+stub_log = work / "llm_stub_calls.jsonl"
+if stub_log.exists():
+    calls = [json.loads(line) for line in stub_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    slots = {c.get("slot") for c in calls}
+    if not calls or slots != {"0"}:
+        raise SystemExit(f"expected LLM stub calls only from slot 0, got {len(calls)} calls for slots {slots}")
+    print(f"LLM stub verified: {len(calls)} calls for slot 0 only")
 
 replay_path = work / "replay.json"
 if not replay_path.exists() or replay_path.stat().st_size == 0:
