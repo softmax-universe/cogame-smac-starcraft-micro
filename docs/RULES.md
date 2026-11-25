@@ -201,18 +201,16 @@ six.
 | `fault` | `sim_fault` | the sim guard tripped |
 | `fault` | `host_error` | an unexpected server-side exception |
 
-A seat that never connects does **not** end the episode: after 2400 lobby ticks
-the no-show is reported to the platform, its unit is driven by the `focusfire`
-baseline for the whole episode, and all three battles play out.
+A seat that never connects ends the episode as an explicit player failure
+(`COGAME_PLAYER_FAILURE_URI`) after `lobbyJoinTimeoutTicks` lobby ticks without
+fabricating scripted moves or publishing scores.
 
 ## The two published scripted baselines
 
-**`focusfire`** — the certification player, the per-turn LLM fallback, the
-driver of a no-show seat, and the default for a seat that registers with
-neither `PLAYER_PROMPT` nor `PLAYER_SCRIPTED`. Every governed unit derives the
-**same** kill order from state alone, so the seats that can concentrate fire —
-the **rangers** — converge on one target without communicating, each from its
-own standoff post:
+**`focusfire`** — the explicit scripted baseline (`PLAYER_SCRIPTED=focusfire`).
+Every governed unit derives the **same** kill order from state alone, so the
+seats that can concentrate fire — the **rangers** — converge on one target
+without communicating, each from its own standoff post:
 
 1. Rank the living enemies by, in order: (a) inside 420 px of any living
    friendly unit before everything else; (b) current hp ascending; (c) integer

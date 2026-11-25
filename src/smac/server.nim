@@ -1214,11 +1214,11 @@ proc declarePlayerFailure(slot: int, message: string) =
 
 proc parseRegistration(
   text: string
-): tuple[ok: bool, prompt, scripted, policy: string] =
+): tuple[ok, llm: bool, prompt, scripted, policy: string] =
   ## A seat's ONE Sprite v1 chat message, read as its registration:
-  ##   {"type":"register","prompt":"…","scripted":"holdline"|null,"policy":"…"}
+  ##   {"type":"register","llm":true|false,"prompt":"…","scripted":"focusfire"|"charge"|null,"policy":"…"}
   ## Anything that is not that object is not a registration.
-  result = (false, "", "", "")
+  result = (false, false, "", "", "")
   if text.len == 0 or text[0] != '{':
     return
   var node: JsonNode
@@ -1229,6 +1229,7 @@ proc parseRegistration(
   if node.kind != JObject or node{"type"}.getStr() != "register":
     return
   result.ok = true
+  result.llm = node{"llm"}.getBool(false)
   result.prompt = node{"prompt"}.getStr()
   if not node{"scripted"}.isNil and node{"scripted"}.kind == JString:
     result.scripted = node{"scripted"}.getStr()
@@ -1374,7 +1375,6 @@ proc runServerLoop*(
     engine =
       if squadMode: initDecisionEngine(sim) else: DecisionEngine()
     squadsBuilt = false
-    squadForceStart = false
     lastTurnKey = -1
     episodeStart = getMonoTime()
     deadlineHit = false
@@ -1550,19 +1550,21 @@ proc runServerLoop*(
             sim.removePlayer(websocket)
             socketsToClose.add(websocket)
         if squadMode and not squadsBuilt and sim.lobbyJoinTimedOut():
-          # A seat that never connects does NOT end the episode. Report the
-          # no-show to the platform (lowest missing slot only), then build the
-          # squads anyway: that seat's cogs run the published holdline
-          # baseline for the whole episode and both games play to full time.
+          # A seat that never connects ends the episode as a terminal player
+          # failure without fabricating scripted moves or publishing scores.
           let stuckSlot = sim.nextPlayerSlot()
           declarePlayerFailure(
             stuckSlot,
             "player slot " & $stuckSlot & " never joined the lobby within " &
               $sim.config.lobbyJoinTimeoutTicks & " lobby ticks (~" &
-              $(sim.config.lobbyJoinTimeoutTicks div TargetFps) &
-              "s); its squad plays the holdline baseline"
+              $(sim.config.lobbyJoinTimeoutTicks div TargetFps) & "s)"
           )
-          squadForceStart = true
+          raise newException(
+            SmacError,
+            "lobby join timeout: slot " & $stuckSlot &
+              " never joined within " & $sim.config.lobbyJoinTimeoutTicks &
+              " lobby ticks"
+          )
         if not replayLoaded and not squadMode and sim.lobbyJoinTimedOut():
           # Joins are strictly slot-sequential, so the seat the lobby is stuck
           # waiting on is exactly nextPlayerSlot(). Declare it before dying so
@@ -1661,7 +1663,7 @@ proc runServerLoop*(
           # replay's join stream leaks no policy identity; the real names ride
           # in the config JSON and in the redacted `register` records.
           if squadMode and not squadsBuilt and sim.phase == Lobby and
-              (sim.players.len >= config.numAgents or squadForceStart):
+              sim.players.len >= config.numAgents:
             for order in sim.players.len ..< sim.totalCogs():
               try:
                 discard sim.addPlayer(
@@ -1770,11 +1772,12 @@ proc runServerLoop*(
               let firstRegistration = not policy.registered
               policy.registered = true
               policy.prompt = registration.prompt.truncateRunes(MaxPromptRunes)
-              policy.isLlm = policy.prompt.len > 0
+              policy.isLlm = (registration.llm or policy.prompt.len > 0) and
+                registration.scripted.len == 0
               policy.baseline = parseBaseline(registration.scripted)
               policy.label =
                 if registration.policy.len > 0: registration.policy
-                elif policy.isLlm: "prompt"
+                elif policy.isLlm: "model"
                 else: $policy.baseline
               engine.seats[playerIndex] = policy
               if playerIndex <= sim.seatPolicyKind.high:
@@ -1957,9 +1960,23 @@ proc runServerLoop*(
           if config.maxTicks > 0: max(1, config.maxTicks div turnTicks) else: 0
         let records = engine.turn(
           sim, turnIndex, turnsPerBattle, elapsedSeconds)
-        engine.snapshotTurn(sim)
         for record in records:
           replayWriter.writeChat(tickTime(sim.tickCount), 0, record)
+        if engine.failed:
+          let failureMsg =
+            "seat " & $engine.failedSeat & " policy failure (" &
+              engine.failureCause & "): " & engine.failureDetail
+          echo "smac: terminating episode on policy failure: ", failureMsg
+          engine.capture.finishFailure(
+            engine.failedSeat, engine.failureCause, engine.failureDetail)
+          declarePlayerFailure(engine.failedSeat, failureMsg)
+          replayWriter.closeReplayWriter()
+          if saveReplayPath.len > 0 and fileExists(saveReplayPath):
+            runtimeConfig.writeReplay(readFile(saveReplayPath))
+          httpServer.close()
+          joinThread(serverThread)
+          quit(1)
+        engine.snapshotTurn(sim)
         for seat in 0 ..< engine.directives.len:
           if not engine.haveDirective[seat]:
             continue
@@ -2004,15 +2021,6 @@ proc runServerLoop*(
               order = candidate
               found = true
               break
-        if not found:
-          # The seat has no directive yet — it has not registered, or its first
-          # turn has not landed. It plays the published `focusfire` baseline,
-          # which is what "adapt to a partner you know the rules of" means
-          # here. NO FAILURE MODE LEAVES A UNIT UNACTUATED.
-          let scripted = engine.focusfireFor(sim, @[cogIndex])
-          if scripted.orders.len > 0:
-            order = scripted.orders[0]
-            found = true
         if not found:
           continue
         let mask = engine.ctl.compileMask(sim, order, cogIndex)

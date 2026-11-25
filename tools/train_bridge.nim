@@ -82,7 +82,6 @@ when isMainModule:
         cy = cy div count
       var directive = parseSquadDirective(extractJsonObject(request["response"].getStr()),
         @[game.cogAlias(seat)], @[seat], cx, cy, MapWidth - 1, MapHeight - 1)
-      engine.repairMissingOrders(game, seat, directive)
       pending.add(directive)
       response = %*{"kind": "accepted", "action": action(directive, game, seat, turn)}
       inc seat

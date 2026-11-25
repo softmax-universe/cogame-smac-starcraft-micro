@@ -57,12 +57,13 @@ Intents: `focus`, `attack_move`, `kite`, `hold`, `screen`, `retreat`, `regroup`.
 `docs/COMMANDING.md` explains what each one compiles to and what a good prompt
 says.
 
-Two scripted baselines ship in the same image, selected by environment variable
-rather than by code: `focusfire` (the published default, the certification
-player and the per-turn fallback) and `charge` (deliberately weaker, and
-different in SHAPE so the ladder gets a spread). Both are documented in
-`docs/RULES.md`, so cooperating with a scripted partner means cooperating with a
-partner whose rules you know.
+Two bundled player roles ship in the manifest: `model` (LLM-driven unit
+commander using `COWORLD_LLM_ENABLED=true`) and `baseline` (explicit scripted
+`focusfire` player). Two scripted baselines ship in the image, selected by
+`PLAYER_SCRIPTED`: `focusfire` and `charge` (deliberately weaker, and different
+in SHAPE so the ladder gets a spread). Both are documented in `docs/RULES.md`,
+so cooperating with a scripted partner means cooperating with a partner whose
+rules you know.
 
 ```bash
 coworld upload-policy coworld-smac-starcraft-micro \

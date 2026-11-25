@@ -1,4 +1,4 @@
-## Tolerant parsing and repair, including the 4-byte-emoji rune boundary.
+## Strict directive parsing and rune-boundary UTF-8 safety.
 import std/[json, unicode, unittest]
 import smac_helpers
 
@@ -11,131 +11,110 @@ proc parse(text: string): SquadDirective =
                       MapWidth - 1, MapHeight - 1)
 
 suite "directives":
-  test "prose-prefixed and fenced JSON both parse":
-    check parse("Sure! Here you go:\n```json\n" &
+  test "valid canonical JSON object parses":
+    let d = parse(
       """{"note":"go","cogs":[{"id":"RANGER-alpha","intent":"focus",""" &
-      """"target_id":3,"target":[10,10],"say":"E3"}]}""" & "\n```").
-      orders[0].targetId == 3
-    check parse("""thinking... {"note":"n","cogs":[{"id":"RANGER-alpha"}]}""").
-      orders[0].fromReply
+      """"target_id":3,"target":[10,10],"face":[20,20],"say":"E3"}]}""")
+    check d.orders.len == 1
+    check d.orders[0].fromReply
+    check d.orders[0].intent == intFocus
+    check d.orders[0].targetId == 3
+    check d.orders[0].targetX == 10
+    check d.orders[0].targetY == 10
+    check d.orders[0].hasFace
+    check d.orders[0].faceX == 20
+    check d.orders[0].faceY == 20
+    check d.orders[0].say == "E3"
+    check d.source == dsLlm
 
-  test "cogs as an id-keyed object is accepted":
-    let d = parse("""{"cogs":{"RANGER-alpha":{"intent":"kite","target_id":2}}}""")
-    check d.orders[0].intent == intKite
-    check d.orders[0].targetId == 2
+  test "clean fenced JSON object parses; prose-prefixed and non-JSON are rejected":
+    let fenced = parse("```json\n" &
+      """{"note":"go","cogs":[{"id":"RANGER-alpha","intent":"focus","target_id":3}]}""" &
+      "\n```")
+    check fenced.orders[0].targetId == 3
+    expect DirectiveError:
+      discard parse("Sure! Here you go:\n```json\n" &
+        """{"note":"go","cogs":[{"id":"RANGER-alpha","intent":"focus"}]}""" & "\n```")
+    expect DirectiveError:
+      discard parse("""thinking... {"note":"n","cogs":[{"id":"RANGER-alpha","intent":"focus"}]}""")
+    expect DirectiveError:
+      discard parse("no json at all here")
 
-  test "unknown and hyphenated intents normalise":
-    check parse("""{"cogs":[{"id":"RANGER-alpha","intent":"ATTACK-MOVE"}]}""").
-      orders[0].intent == intAttackMove
-    check parse("""{"cogs":[{"id":"RANGER-alpha","intent":"nonsense"}]}""").
-      orders[0].intent == intFocus
+  test "alternate cogs object representation is rejected":
+    expect DirectiveError:
+      discard parse("""{"cogs":{"RANGER-alpha":{"intent":"kite","target_id":2}}}""")
 
-  test "target_id accepts E3, e3, a numeric string and a float":
-    check readTargetId(%"E3") == 3
-    check readTargetId(%"e3") == 3
-    check readTargetId(%"7") == 7
-    check readTargetId(%3.0) == 3
+  test "unknown, missing, and aliased intents are rejected":
+    expect DirectiveError:
+      discard parse("""{"cogs":[{"id":"RANGER-alpha","intent":"ATTACK-MOVE"}]}""")
+    expect DirectiveError:
+      discard parse("""{"cogs":[{"id":"RANGER-alpha","intent":"nonsense"}]}""")
+    expect DirectiveError:
+      discard parse("""{"cogs":[{"id":"RANGER-alpha"}]}""")
+
+  test "target_id accepts integer or null and rejects string/float shims":
+    check readTargetId(%3) == 3
     check readTargetId(newJNull()) == -1
-    check readTargetId(%"nonsense") == -1
+    expect DirectiveError:
+      discard readTargetId(%"E3")
+    expect DirectiveError:
+      discard readTargetId(%"7")
+    expect DirectiveError:
+      discard readTargetId(%3.0)
+    expect DirectiveError:
+      discard readTargetId(%"nonsense")
 
-  test "an off-map target is clamped and a missing one takes the default":
-    let far = parse("""{"cogs":[{"id":"RANGER-alpha","target":[99999,-4]}]}""")
+  test "an off-map target is clamped, null takes default, malformed rejects":
+    let far = parse("""{"cogs":[{"id":"RANGER-alpha","intent":"focus","target":[99999,-4]}]}""")
     check far.orders[0].targetX == MapWidth - 1
     check far.orders[0].targetY == 0
-    let none = parse("""{"cogs":[{"id":"RANGER-alpha"}]}""")
+    let none = parse("""{"cogs":[{"id":"RANGER-alpha","intent":"focus"}]}""")
     check none.orders[0].targetX == 600
     check none.orders[0].targetY == 330
+    expect DirectiveError:
+      discard parse("""{"cogs":[{"id":"RANGER-alpha","intent":"focus","target":{"x":10,"y":20}}]}""")
 
-  test "three cogs keep the first, an id from another seat lands by position":
-    let many = parse("""{"cogs":[{"id":"RANGER-alpha"},{"id":"BLADE-alpha"},""" &
-      """{"id":"BLADE-beta"}]}""")
-    check many.orders.len == 1
-    let other = parse("""{"cogs":[{"id":"BLADE-gamma","intent":"hold"}]}""")
-    check other.orders.len == 1
-    check other.orders[0].id == "RANGER-alpha"
-    check other.orders[0].intent == intHold
+  test "extra cogs, wrong id, or empty cogs are rejected":
+    expect DirectiveError:
+      discard parse("""{"cogs":[{"id":"RANGER-alpha","intent":"focus"},{"id":"BLADE-alpha","intent":"focus"}]}""")
+    expect DirectiveError:
+      discard parse("""{"cogs":[{"id":"BLADE-gamma","intent":"hold"}]}""")
+    expect DirectiveError:
+      discard parse("""{"note":"n","cogs":[{"id":"NOT-A-SEAT","intent":"kite","target_id":5,"say":"E5"}]}""")
+    for text in ["""{"note":"nothing to say","cogs":[]}""",
+                 """{"note":"nothing to say"}""",
+                 """{"note":"nothing to say","cogs":["E3"]}"""]:
+      expect DirectiveError:
+        discard parse(text)
 
-  test "a runaway cogs[].id is capped on a rune boundary, at 16":
-    ## MaxCogIdRunes is now applied where it means something: `cogs[].id` is
-    ## the one unbounded MODEL-authored string the matcher reads, and it reads
-    ## it with `endsWith` both ways. The cut is on a rune boundary, so a 4-byte
-    ## emoji at the cap cannot be split in half.
+  test "exact matching handles full-length unit aliases":
     check MaxCogIdRunes == 16
     check "RANGER-epsilon".runeLen <= MaxCogIdRunes
-    let runaway = parse(
-      "{\"cogs\":[{\"id\":\"RANGER-alpha" & "\u{1F600}".repeat(40) &
-      "\",\"intent\":\"kite\"}]}")
-    check runaway.orders.len == 1
-    check runaway.orders[0].id == "RANGER-alpha"
-    check runaway.orders[0].intent == intKite
-    # And 16 is not a cap that CUTS a real id: the longest alias this game
-    # issues is 14 runes, and it has to keep matching BY NAME — a shorter cap
-    # would fall through to positional assignment and hand each cog the other's
-    # order.
     let pair = parseSquadDirective(
       extractJsonObject(
-        "{\"cogs\":[{\"id\":\"RANGER-epsilon\",\"intent\":\"hold\"}," &
-        "{\"id\":\"BLADE-alpha\",\"intent\":\"kite\"}]}"),
+        """{"cogs":[{"id":"RANGER-epsilon","intent":"hold"},""" &
+        """{"id":"BLADE-alpha","intent":"kite"}]}"""),
       @["BLADE-alpha", "RANGER-epsilon"], @[2, 4],
       600, 330, MapWidth - 1, MapHeight - 1)
     check pair.orders[0].intent == intKite
     check pair.orders[1].intent == intHold
 
-  test "a wrong-id entry lands by position and stays an LLM order":
-    ## Design §Reply schema, the `cogs[].id` row: "an unmatched entry is
-    ## assigned to the seat's unit by position". The order is the MODEL's, so it
-    ## reads `fromReply` and the directive stays `llm`-sourced — a model that
-    ## invented its own naming is rescued, not fallen back on.
-    let d = parse("""{"note":"n","cogs":[{"id":"NOT-A-SEAT","intent":"kite",""" &
-      """"target_id":5,"say":"E5"}]}""")
-    check d.orders.len == 1
-    check d.orders[0].id == "RANGER-alpha"
-    check d.orders[0].fromReply
-    check d.orders[0].intent == intKite
-    check d.orders[0].targetId == 5
-    check d.orders[0].say == "E5"
-    check d.source == dsLlm
-
-  test "zero cog entries repair; only unrecoverable text raises":
-    ## Design §Reply schema, the `cogs` row: "an empty or missing array keeps
-    ## last turn's directive, else focusfire's" — a REPAIR the caller applies
-    ## (tests/test_engine.nim pins both halves), not a parse failure. So the
-    ## reply parses, the model's note survives, every order reads
-    ## `fromReply = false` for the caller to fill, and no retry is burned.
-    for text in ["""{"note":"nothing to say","cogs":[]}""",
-                 """{"note":"nothing to say"}""",
-                 """{"note":"nothing to say","cogs":["E3"]}"""]:
-      let d = parse(text)
-      check d.orders.len == 1
-      check d.orders[0].cogIndex == 0
-      check not d.orders[0].fromReply
-      check d.note == "nothing to say"
-      check d.source == dsLlm
-    ## Only a reply from which NO object can be recovered at all is fatal, and
-    ## that is what the retry and then the scripted fallback exist for.
-    expect DirectiveError:
-      discard parse("no json at all here")
-
   test "a 300-character note is cut to 160 runes":
     var long = ""
     for _ in 0 ..< 300:
       long.add('x')
-    let d = parse("""{"note":"""" & long & """","cogs":[{"id":"RANGER-alpha"}]}""")
+    let d = parse("""{"note":"""" & long & """","cogs":[{"id":"RANGER-alpha","intent":"focus"}]}""")
     check d.note.runeLen == MaxNoteRunes
 
   test "a say whose 10th and 11th characters are a 4-byte emoji cuts on a rune":
-    # The cut MUST land on a rune boundary: a byte-truncated multi-byte
-    # character renders in a browser and then fails a strict UTF-8 parser.
     let say = "abcdefghi\u{1F600}\u{1F600}"
     check say.runeLen == 11
     let cut = say.truncateRunes(MaxSayRunes)
     check cut.runeLen == MaxSayRunes
     check cut.validateUtf8() == -1
-    # The sanitiser drops the non-ASCII runes but never leaves half of one.
     let sanitized = sanitizeSay(say)
     check sanitized.validateUtf8() == -1
     check sanitized.runeLen <= MaxSayRunes
-    # And it still round-trips through the JSON the replay actually carries.
     let record = $(%*{"say": cut})
     check parseJson(record)["say"].getStr() == cut
 

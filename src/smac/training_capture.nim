@@ -85,6 +85,16 @@ proc applied*(capture: RuntimeCapture, seat, tick: int, action: JsonNode,
     if fallback: asFallback else: asAccepted,
     fallbackOrigin = (if fallback: some(policy) else: none(string)))
 
+proc recordFailure*(capture: RuntimeCapture, seat, tick: int, reason: string) =
+  if capture == nil: return
+  var attempts = capture.turn[seat].attempts
+  if attempts.len == 0:
+    var failed = newDecisionAttempt($tick & "-" & $seat & "-failed", "model", aoModel)
+    failed.rejectionReason = some(reason)
+    attempts.add(failed)
+  capture.trajectory.recordDecision($tick & "-" & $seat, $seat,
+    capture.turn[seat].observation, attempts, none(string), newJNull(), asRejected)
+
 proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   if capture == nil: return
   let reason = outcome{"reason"}.getStr()
@@ -93,4 +103,14 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
     of "deadline": esTruncated
     else: esFailed
   capture.trajectory.finish(status, outcome, outcome{"scores"})
+  capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+
+proc finishFailure*(capture: RuntimeCapture, seat: int, cause, detail: string) =
+  if capture == nil: return
+  let outcome = %*{
+    "failed_policy_index": seat,
+    "cause": cause,
+    "message": detail
+  }
+  capture.trajectory.finish(esFailed, outcome, newJNull())
   capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))

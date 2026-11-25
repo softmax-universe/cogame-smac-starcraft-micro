@@ -31,12 +31,13 @@ const
   ReconnectAttempts = 6      ## 6 x 500 ms of re-dialling after a live socket
                              ## dies, before accepting the game is gone.
 
-proc registrationBlob(prompt, scripted, policy: string): string =
+proc registrationBlob(llm: bool, prompt, scripted, policy: string): string =
   ## The one registration message. `scripted` is JSON null when the seat is
-  ## an LLM seat, so the server can tell "no baseline named" from "holdline
-  ## named explicitly".
+  ## an LLM seat, so the server can tell explicit scripted policies from model
+  ## seats.
   var node = %*{
     "type": "register",
+    "llm": llm,
     "prompt": prompt,
     "policy": policy
   }
@@ -60,16 +61,18 @@ when isMainModule:
   if url.len == 0:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
   let
+    llmEnabled = getEnv("COWORLD_LLM_ENABLED").strip().toLowerAscii() == "true"
     prompt = getEnv("PLAYER_PROMPT").strip()
     scripted = getEnv("PLAYER_SCRIPTED").strip()
+    isLlm = (llmEnabled or prompt.len > 0) and scripted.len == 0
     label = block:
       let explicit = getEnv("PLAYER_POLICY_LABEL").strip()
       if explicit.len > 0: explicit
-      elif prompt.len > 0: "prompt"
+      elif isLlm: "model"
       elif scripted.len > 0: scripted
       else: "focusfire"
   echo "smac player: kind=",
-    (if prompt.len > 0: "llm" else: "scripted"),
+    (if isLlm: "llm" else: "scripted"),
     " baseline=", (if scripted.len > 0: scripted else: "focusfire"),
     " label=", label
 
@@ -114,7 +117,7 @@ when isMainModule:
   while true:
     var sessionFrames = 0
     try:
-      socket.send(registrationBlob(prompt, scripted, label), BinaryMessage)
+      socket.send(registrationBlob(isLlm, prompt, scripted, label), BinaryMessage)
       var resends = 0
       while true:
         let received = socket.receiveMessage()
@@ -124,7 +127,7 @@ when isMainModule:
         if resends < RegistrationResends and
             sessionFrames mod ResendEveryFrames == 1:
           inc resends
-          socket.send(registrationBlob(prompt, scripted, label), BinaryMessage)
+          socket.send(registrationBlob(isLlm, prompt, scripted, label), BinaryMessage)
         socket.send(readyBlob(), BinaryMessage)
     except CatchableError as error:
       echo "smac player: socket closed (", error.msg, ")"
